@@ -1,49 +1,101 @@
-package interest
+package stormshieldLogs
 
 
-import org.apache.spark.sql.{Column, DataFrame, Dataset, Row, SparkSession}
+import org.apache.spark.sql.{Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{DataTypes, DateType, DoubleType, StructField, StructType, TimestampType}
+import org.apache.spark.sql.functions.regexp_replace
+import org.apache.spark.sql.functions.{call_udf, col, lit, when}
+import org.apache.spark.sql.types.DataTypes
 
-object interestCalc {
+import scala.collection.immutable.Map
 
-  def main(args: Array[String]): Unit = {
+
+object stormshieldLogs {
+
+
+  var fullCols:Map[String,String] = Map( // empty Map     for use in UDF mapColumns
+    "" -> "")
+
+  def RawTextStoreParquet(spark:SparkSession,loadPath:String,savePath:String): Dataset[Row] = {
+    //load multiple text files, save to parquet format and return dataframe
+    val dfLogs: Dataset[Row] = spark.read.text(loadPath)
+    dfLogs.repartition(1).write.mode("overwrite").parquet(savePath)
+
+    dfLogs
+  }
+
+  def GetAndStoreUniqueCols(spark: SparkSession, df: Dataset[Row]):Map[String,String] = {
+    //get all unique column sets from dataset within string  "field1=value1 field2=value2"
+    import spark.implicits._
+    val result = df
+      .withColumn("value", regexp_replace(col("value"), "\"(.*?)\"", ""))
+      .withColumn("value", regexp_replace(col("value"), "(?<==).*?(?=( ([a-z])|$))", ""))
+      .withColumn("value", regexp_replace(col("value"), "=", ""))
+      .select(split(col("value"), " ").as("IdsArray")).distinct()
+      .withColumn("IdsArray", explode($"IdsArray")).distinct()
+      //result.write.mode("overwrite").text("uniqueIDs.txt")
+      //create colName -> NULL Map
+      val headers = result.select("IdsArray").collect.toList
+      headers.map(t => t.getString(0) -> "NULL").toMap // create empty columns map
+  }
+
+  var cols: Map[String, String] = Map( // empty Map for use in UDF mapColumns
+    "" -> "",
+  )
+
+val mapCols = (row: String) => {
+  val pattern: String = "[ =]+(?=(?:[^\"]*[\"][^\"]*[\"])*[^\"]*$)" // match ;= outside double quotes ""
+  val pairs = row.split(pattern).grouped(2) // split and group to (key, value)
+  val result = cols ++ pairs.map { case Array(k, v) => k -> v }.toMap //insert values
+  result
+  }:Map[String,String]
+
+
+
+  val saveIntermediateResults:Boolean = false
+
+def main(args: Array[String]): Unit = {
     val spark: SparkSession = SparkSession.builder()
-      .appName("interest")
-      .master("local")
+      .appName("StormShieldLogs")
+      .master("local[*]")
       .getOrCreate()
 
-    val InterestCapitalizationWithContributionUDF: InterestCapitalizationWithContributionUDF = new InterestCapitalizationWithContributionUDF()
-    spark.udf.register("InterestCapitalizationWithContributionUDF", InterestCapitalizationWithContributionUDF, DataTypes.DoubleType)
+  import spark.implicits._
 
-    val InterestCapitalizationUDF: InterestCapitalizationUDF = new InterestCapitalizationUDF()
-    spark.udf.register("InterestCapitalizationUDF", InterestCapitalizationUDF, DataTypes.DoubleType)
+        // log types (directory)
+        //alarm.auth,connections,filterstat,monitor,plugin,system,web
 
-   var peopleDF = spark.read
-     .option("header", "true")
-     .csv("money_saving.csv")
+        val logDir = "auth"
+        val logDirPath = s"E:/logsALL/${logDir}/*.log"
+        val logsDF = spark.read.text(logDirPath)
 
-    peopleDF.show()
-    peopleDF.printSchema()
+        if(saveIntermediateResults) {logsDF.write.mode("overwrite").parquet(s"${logDir}.parquet")}
 
-    val peopleWithMoneYearlyContributionDF: Dataset[Row] = peopleDF
-      .withColumn("money", col("money").cast(DataTypes.DoubleType))
-      .withColumn("interest", col("interest").cast(DataTypes.DoubleType))
-      .withColumn("10yearsContribution", call_udf("InterestCapitalizationWithContributionUDF", col("money"), lit(10), col("interest"),lit(1000)))
-      .withColumn("20yearsContribution", call_udf("InterestCapitalizationWithContributionUDF", col("money"), lit(20), col("interest"),lit(1000)))
-      .withColumn("40yearsContribution", call_udf("InterestCapitalizationWithContributionUDF", col("money"), lit(40), col("interest"),lit(1000)))
-      .withColumn("60yearsContribution", call_udf("InterestCapitalizationWithContributionUDF", col("money"), lit(60), col("interest"),lit(1000)))
+        cols = GetAndStoreUniqueCols(spark,logsDF) // store into global variable
 
-    val peopleWithMoneyNoContributionDF: Dataset[Row] = peopleDF
-      .withColumn("money", col("money").cast(DataTypes.DoubleType))
-      .withColumn("interest", col("interest").cast(DataTypes.DoubleType))
-      .withColumn("10years", call_udf("interestCapitalizationUDF", col("money"), lit(10), col("interest")))
-      .withColumn("20years", call_udf("interestCapitalizationUDF", col("money"), lit(20), col("interest")))
-      .withColumn("40years", call_udf("interestCapitalizationUDF", col("money"), lit(40), col("interest")))
-      .withColumn("60years", call_udf("interestCapitalizationUDF", col("money"), lit(60), col("interest")))
+        val mapColUDF = udf(mapCols)
 
-    peopleWithMoneYearlyContributionDF.show()
-    peopleWithMoneyNoContributionDF.show()
+        spark.udf.register("mapColUDF", mapColUDF)
 
+        val result = logsDF.withColumn("value", call_udf("mapColUDF", col("value")))
+
+        result.show(false)
+
+        val keysDF = result.select(explode(map_keys($"value"))).distinct()           // extract keys to DF
+        val keys = keysDF.collect().map(f => f.get(0))                               // extract keys from DF to Map
+        val keyCols = keys.map(f => col("value").getItem(f).as(f.toString)) // create Array of columns from Map
+
+        val finalResult = result.select(col("value") +: keyCols: _*).drop("value")
+
+        if(saveIntermediateResults) {finalResult.write.mode("overwrite").parquet(s"${logDir}_final.parquet")}
+
+        val usersCount:Int = finalResult.select("user").distinct().count().toInt
+
+        finalResult.select("user").distinct().sort("user").show( usersCount,false)
+
+        println(usersCount)
+        // logsDF.show(truncate = false)
+        //finalResult.show(truncate = false)
   }
 }
+
