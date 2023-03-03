@@ -5,6 +5,8 @@ import org.apache.spark.sql.{Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.functions.regexp_replace
 import org.apache.spark.sql.functions.{call_udf, col, lit, when}
+
+
 import org.apache.spark.sql.types.DataTypes
 
 import scala.collection.immutable.Map
@@ -50,9 +52,7 @@ val mapCols = (row: String) => {
   result
   }:Map[String,String]
 
-
-
-  val saveIntermediateResults:Boolean = false
+val saveIntermediateResults:Boolean = false
 
 def main(args: Array[String]): Unit = {
     val spark: SparkSession = SparkSession.builder()
@@ -71,11 +71,27 @@ def main(args: Array[String]): Unit = {
 
         if(saveIntermediateResults) {logsDF.write.mode("overwrite").parquet(s"${logDir}.parquet")}
 
-        cols = GetAndStoreUniqueCols(spark,logsDF) // store into global variable
+        fullCols = GetAndStoreUniqueCols(spark,logsDF) // store into global variable
 
-        val mapColUDF = udf(mapCols)
+        //-------------------------------------------------------------------------------------------------------------------------------------------------
+        // tak działa gdy do register.udf przekazuja sie bezpośrednio funkcje zwracajaca Map[String,String]
+        val mapColUDF = udf(mapCols) // mapCols funkcja zdeklarowana lokalnie
+        spark.udf.register("mapColUDF",mapColUDF)
 
-        spark.udf.register("mapColUDF", mapColUDF)
+
+         //-------------------------------------------------------------------------------------------------------------------------------------------------
+        //to nie działa bo w przypadku gdy drugim parametrem udf.register jest class to w trzecim trzeba wpisac zwracany typ
+        //nia działa Map[String,String] ani java.util.Map które rzekomo jest klasa pierwotną
+
+
+        //val mapColUDF: addColsApp = new addColsApp()
+        //mapColUDF.cols = fullCols
+        //spark.udf.register("mapColUDF",mapColUDF,?????) // jaki typ przekazać dla Map[String,String]?
+
+        //-------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+        //logsDF.show(false)
 
         val result = logsDF.withColumn("value", call_udf("mapColUDF", col("value")))
 
